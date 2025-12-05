@@ -1,0 +1,1 @@
+g++ main.cpp -o tommy_nulls.exe -static
