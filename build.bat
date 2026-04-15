@@ -1,1 +1,1 @@
-g++ main.cpp -o tommy_nulls.exe -static
+g++ main.cpp -o tommy_nulls.exe -static && wsl g++ main.cpp -o tommy_nulls -static
