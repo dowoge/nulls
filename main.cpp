@@ -1,5 +1,7 @@
 #ifdef _WIN32
 #include <windows.h>
+const int KEY_W = 'W', KEY_A = 'A', KEY_S = 'S', KEY_D = 'D';
+const int KEY_SPACE = VK_SPACE, KEY_INSERT = VK_INSERT, KEY_F7 = VK_F7;
 #else
 #include <linux/uinput.h>
 #include <linux/input.h>
@@ -15,9 +17,15 @@
 
 bool running = true;
 bool wReleaseEnabled = true;
-bool physicalW = false, physicalA = false, physicalS = false, physicalD = false;
-bool activeW = false, activeA = false, activeS = false, activeD = false;
-int lastHorizontal = 0, lastVertical = 0;
+
+struct Axis {
+    int posKey, negKey;
+    bool posPhysical = false, negPhysical = false;
+    bool posActive = false, negActive = false;
+    int lastPressed = 0;
+};
+Axis vertical = {KEY_W, KEY_S};
+Axis horizontal = {KEY_D, KEY_A};
 
 #ifdef _WIN32
 HHOOK keyboardHook = NULL;
@@ -48,10 +56,6 @@ void SendKeyValue(int key, int value) {
 void SendKey(int key, bool down) { SendKeyValue(key, down ? 1 : 0); }
 #endif
 
-#ifdef _WIN32
-const int KEY_W = 'W', KEY_A = 'A', KEY_S = 'S', KEY_D = 'D', KEY_SPACE = VK_SPACE, KEY_INSERT = VK_INSERT, KEY_F7 = VK_F7;
-#endif
-
 void SetKeyState(bool& active, bool shouldBeActive, int key) {
     if (shouldBeActive != active) {
         SendKey(key, shouldBeActive);
@@ -59,14 +63,15 @@ void SetKeyState(bool& active, bool shouldBeActive, int key) {
     }
 }
 
-void UpdateHorizontal() {
-    SetKeyState(activeA, physicalA && (!physicalD || lastHorizontal == KEY_A), KEY_A);
-    SetKeyState(activeD, physicalD && (!physicalA || lastHorizontal == KEY_D), KEY_D);
+void UpdateAxis(Axis& a) {
+    SetKeyState(a.posActive, a.posPhysical && (!a.negPhysical || a.lastPressed == a.posKey), a.posKey);
+    SetKeyState(a.negActive, a.negPhysical && (!a.posPhysical || a.lastPressed == a.negKey), a.negKey);
 }
 
-void UpdateVertical() {
-    SetKeyState(activeW, physicalW && (!physicalS || lastVertical == KEY_W), KEY_W);
-    SetKeyState(activeS, physicalS && (!physicalW || lastVertical == KEY_S), KEY_S);
+Axis* AxisForKey(int key) {
+    if (key == horizontal.posKey || key == horizontal.negKey) return &horizontal;
+    if (key == vertical.posKey || key == vertical.negKey) return &vertical;
+    return nullptr;
 }
 
 void HandleKey(int key, bool isKeyDown, bool isKeyUp) {
@@ -80,26 +85,26 @@ void HandleKey(int key, bool isKeyDown, bool isKeyUp) {
         PostQuitMessage(0);
 #endif
     }
-    else if (key == KEY_SPACE && isKeyDown && wReleaseEnabled && activeW) {
-        SendKey(KEY_W, false);
-        activeW = false;
+    else if (key == KEY_SPACE && isKeyDown && wReleaseEnabled && vertical.posActive) {
+        SendKey(vertical.posKey, false);
+        vertical.posActive = false;
     }
 }
 
 bool HandleMovement(int key, bool isKeyDown, bool isKeyUp) {
-    if (key == KEY_A || key == KEY_D) {
-        bool& physical = (key == KEY_A) ? physicalA : physicalD;
-        if (isKeyDown && !physical) { physical = true; lastHorizontal = key; UpdateHorizontal(); return true; }
-        else if (isKeyUp) { physical = false; UpdateHorizontal(); return true; }
-        else if (isKeyDown) return true;
-    }
-    else if (key == KEY_W || key == KEY_S) {
-        bool& physical = (key == KEY_W) ? physicalW : physicalS;
-        if (isKeyDown && !physical) { physical = true; lastVertical = key; UpdateVertical(); return true; }
-        else if (isKeyUp) { physical = false; UpdateVertical(); return true; }
-        else if (isKeyDown) return true;
-    }
-    return false;
+    Axis* a = AxisForKey(key);
+    if (!a) return false;
+    bool& physical = (key == a->posKey) ? a->posPhysical : a->negPhysical;
+    if (isKeyDown && !physical) { physical = true; a->lastPressed = key; UpdateAxis(*a); }
+    else if (isKeyUp) { physical = false; UpdateAxis(*a); }
+    return true;
+}
+
+void ReleaseAllActive() {
+    SetKeyState(vertical.posActive, false, vertical.posKey);
+    SetKeyState(vertical.negActive, false, vertical.negKey);
+    SetKeyState(horizontal.posActive, false, horizontal.posKey);
+    SetKeyState(horizontal.negActive, false, horizontal.negKey);
 }
 
 #ifdef _WIN32
@@ -114,6 +119,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (HandleMovement(key, isKeyDown, isKeyUp)) return 1;
     }
     return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
+}
+
+int RunWindows() {
+    keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+    if (!keyboardHook) { std::cerr << "hook failed: " << GetLastError() << std::endl; return 1; }
+    MSG message;
+    while (running && GetMessage(&message, NULL, 0, 0)) { TranslateMessage(&message); DispatchMessage(&message); }
+    UnhookWindowsHookEx(keyboardHook);
+    return 0;
 }
 #else
 int SetupUinput() {
@@ -168,18 +182,8 @@ std::vector<int> FindKeyboards() {
 }
 
 void SignalHandler(int) { running = false; }
-#endif
 
-int main() {
-    std::cout << "insert: toggle w release (on by default)\nf7: exit" << std::endl;
-    
-#ifdef _WIN32
-    keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
-    if (!keyboardHook) { std::cerr << "hook failed: " << GetLastError() << std::endl; return 1; }
-    MSG message;
-    while (running && GetMessage(&message, NULL, 0, 0)) { TranslateMessage(&message); DispatchMessage(&message); }
-    UnhookWindowsHookEx(keyboardHook);
-#else
+int RunLinux() {
     if (getuid() != 0) { std::cerr << "run as root" << std::endl; return 1; }
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
@@ -191,13 +195,12 @@ int main() {
     for (int fd : inputFds) pollfds.push_back({fd, POLLIN, 0});
     while (running) {
         if (poll(pollfds.data(), pollfds.size(), 100) <= 0) continue;
-        for (size_t i = 0; i < pollfds.size(); i++) {
-            if (!(pollfds[i].revents & POLLIN)) continue;
+        for (auto& p : pollfds) {
+            if (!(p.revents & POLLIN)) continue;
             struct input_event ev;
-            ssize_t n = read(pollfds[i].fd, &ev, sizeof(ev));
-            if (n != sizeof(ev)) continue;
+            if (read(p.fd, &ev, sizeof(ev)) != sizeof(ev)) continue;
             if (ev.type != EV_KEY) { write(uinputFd, &ev, sizeof(ev)); continue; }
-            bool isMovement = (ev.code == KEY_W || ev.code == KEY_A || ev.code == KEY_S || ev.code == KEY_D);
+            bool isMovement = AxisForKey(ev.code) != nullptr;
             if (ev.value == 2) { if (!isMovement) SendKeyValue(ev.code, 2); continue; }
             HandleKey(ev.code, ev.value == 1, ev.value == 0);
             if (!HandleMovement(ev.code, ev.value == 1, ev.value == 0)) SendKeyValue(ev.code, ev.value);
@@ -206,11 +209,17 @@ int main() {
     for (int fd : inputFds) { ioctl(fd, EVIOCGRAB, 0); close(fd); }
     ioctl(uinputFd, UI_DEV_DESTROY);
     close(uinputFd);
-#endif
-    
-    if (activeW) SendKey(KEY_W, false);
-    if (activeA) SendKey(KEY_A, false);
-    if (activeS) SendKey(KEY_S, false);
-    if (activeD) SendKey(KEY_D, false);
     return 0;
+}
+#endif
+
+int main() {
+    std::cout << "insert: toggle w release (on by default)\nf7: exit" << std::endl;
+#ifdef _WIN32
+    int rc = RunWindows();
+#else
+    int rc = RunLinux();
+#endif
+    ReleaseAllActive();
+    return rc;
 }
