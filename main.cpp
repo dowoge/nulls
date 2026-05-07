@@ -84,8 +84,8 @@ void ApplyVirtual(VirtualKey& vk, bool shouldBeActive) {
     vk.hasPending = false;
 }
 
-void SetVirtualState(VirtualKey& vk, bool shouldBeActive) {
-    if (vk.delayMs <= 0) { ApplyVirtual(vk, shouldBeActive); return; }
+void SetVirtualState(VirtualKey& vk, bool shouldBeActive, bool instant) {
+    if (vk.delayMs <= 0 || (instant && shouldBeActive)) { ApplyVirtual(vk, shouldBeActive); return; }
     if (shouldBeActive == vk.active) { vk.hasPending = false; return; }
     vk.hasPending = true;
     vk.pendingTime = NowMs() + vk.delayMs;
@@ -119,8 +119,9 @@ void UpdateAxis(Axis& a) {
         if (a.woolKey == a.pos.key) posTarget = true;
         else if (a.woolKey == a.neg.key) negTarget = true;
     }
-    SetVirtualState(a.pos, posTarget);
-    SetVirtualState(a.neg, negTarget);
+    bool axisIdle = !a.pos.active && !a.neg.active && !a.pos.hasPending && !a.neg.hasPending;
+    SetVirtualState(a.pos, posTarget, axisIdle);
+    SetVirtualState(a.neg, negTarget, axisIdle);
 }
 
 Axis* AxisForKey(int key) {
