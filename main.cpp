@@ -2,6 +2,7 @@
 #include <windows.h>
 const int KEY_W = 'W', KEY_A = 'A', KEY_S = 'S', KEY_D = 'D';
 const int KEY_SPACE = VK_SPACE, KEY_INSERT = VK_INSERT, KEY_F7 = VK_F7;
+const int KEY_HOME_K = VK_HOME;
 #else
 #include <linux/uinput.h>
 #include <linux/input.h>
@@ -12,20 +13,39 @@ const int KEY_SPACE = VK_SPACE, KEY_INSERT = VK_INSERT, KEY_F7 = VK_F7;
 #include <poll.h>
 #include <signal.h>
 #include <vector>
+const int KEY_HOME_K = KEY_HOME;
 #endif
 #include <iostream>
+#include <chrono>
+#include <cstdlib>
+#include <string>
 
 bool running = true;
 bool wReleaseEnabled = true;
+bool woolEnabled = false;
+bool spaceHeld = false;
+
+long long NowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+struct VirtualKey {
+    int key = 0;
+    int delayMs = 0;
+    bool active = false;
+    bool hasPending = false;
+    long long pendingTime = 0;
+    bool pendingState = false;
+};
 
 struct Axis {
-    int posKey, negKey;
     bool posPhysical = false, negPhysical = false;
-    bool posActive = false, negActive = false;
+    VirtualKey pos, neg;
     int lastPressed = 0;
+    int woolKey = 0;
 };
-Axis vertical = {KEY_W, KEY_S};
-Axis horizontal = {KEY_D, KEY_A};
+Axis vertical, horizontal;
 
 #ifdef _WIN32
 HHOOK keyboardHook = NULL;
@@ -56,21 +76,56 @@ void SendKeyValue(int key, int value) {
 void SendKey(int key, bool down) { SendKeyValue(key, down ? 1 : 0); }
 #endif
 
-void SetKeyState(bool& active, bool shouldBeActive, int key) {
-    if (shouldBeActive != active) {
-        SendKey(key, shouldBeActive);
-        active = shouldBeActive;
+void ApplyVirtual(VirtualKey& vk, bool shouldBeActive) {
+    if (shouldBeActive != vk.active) {
+        SendKey(vk.key, shouldBeActive);
+        vk.active = shouldBeActive;
     }
+    vk.hasPending = false;
+}
+
+void SetVirtualState(VirtualKey& vk, bool shouldBeActive) {
+    if (vk.delayMs <= 0) { ApplyVirtual(vk, shouldBeActive); return; }
+    if (shouldBeActive == vk.active) { vk.hasPending = false; return; }
+    vk.hasPending = true;
+    vk.pendingTime = NowMs() + vk.delayMs;
+    vk.pendingState = shouldBeActive;
+}
+
+void ProcessPending(VirtualKey& vk, long long now) {
+    if (vk.hasPending && now >= vk.pendingTime) ApplyVirtual(vk, vk.pendingState);
+}
+
+void ProcessAllPending() {
+    long long now = NowMs();
+    ProcessPending(vertical.pos, now);
+    ProcessPending(vertical.neg, now);
+    ProcessPending(horizontal.pos, now);
+    ProcessPending(horizontal.neg, now);
+}
+
+long long NextPendingTime() {
+    long long earliest = -1;
+    VirtualKey* keys[] = {&vertical.pos, &vertical.neg, &horizontal.pos, &horizontal.neg};
+    for (VirtualKey* vk : keys)
+        if (vk->hasPending && (earliest < 0 || vk->pendingTime < earliest)) earliest = vk->pendingTime;
+    return earliest;
 }
 
 void UpdateAxis(Axis& a) {
-    SetKeyState(a.posActive, a.posPhysical && (!a.negPhysical || a.lastPressed == a.posKey), a.posKey);
-    SetKeyState(a.negActive, a.negPhysical && (!a.posPhysical || a.lastPressed == a.negKey), a.negKey);
+    bool posTarget = a.posPhysical && (!a.negPhysical || a.lastPressed == a.pos.key);
+    bool negTarget = a.negPhysical && (!a.posPhysical || a.lastPressed == a.neg.key);
+    if (woolEnabled && spaceHeld && &a == &horizontal && !a.posPhysical && !a.negPhysical) {
+        if (a.woolKey == a.pos.key) posTarget = true;
+        else if (a.woolKey == a.neg.key) negTarget = true;
+    }
+    SetVirtualState(a.pos, posTarget);
+    SetVirtualState(a.neg, negTarget);
 }
 
 Axis* AxisForKey(int key) {
-    if (key == horizontal.posKey || key == horizontal.negKey) return &horizontal;
-    if (key == vertical.posKey || key == vertical.negKey) return &vertical;
+    if (key == horizontal.pos.key || key == horizontal.neg.key) return &horizontal;
+    if (key == vertical.pos.key || key == vertical.neg.key) return &vertical;
     return nullptr;
 }
 
@@ -79,32 +134,57 @@ void HandleKey(int key, bool isKeyDown, bool isKeyUp) {
         wReleaseEnabled = !wReleaseEnabled;
         std::cout << "w release: " << (wReleaseEnabled ? "on" : "off") << std::endl;
     }
+    else if (key == KEY_HOME_K && isKeyDown) {
+        woolEnabled = !woolEnabled;
+        std::cout << "wool: " << (woolEnabled ? "on" : "off") << std::endl;
+        if (!woolEnabled) { horizontal.woolKey = 0; UpdateAxis(horizontal); }
+    }
     else if (key == KEY_F7 && isKeyDown) {
         running = false;
 #ifdef _WIN32
         PostQuitMessage(0);
 #endif
     }
-    else if (key == KEY_SPACE && isKeyDown && wReleaseEnabled && vertical.posActive) {
-        SendKey(vertical.posKey, false);
-        vertical.posActive = false;
+    else if (key == KEY_SPACE) {
+        if (isKeyDown && !spaceHeld) {
+            spaceHeld = true;
+            if (wReleaseEnabled) {
+                if (vertical.pos.active) { SendKey(vertical.pos.key, false); vertical.pos.active = false; }
+                vertical.pos.hasPending = false;
+            }
+        } else if (isKeyUp) {
+            spaceHeld = false;
+            horizontal.woolKey = 0;
+            UpdateAxis(horizontal);
+        }
     }
 }
 
 bool HandleMovement(int key, bool isKeyDown, bool isKeyUp) {
     Axis* a = AxisForKey(key);
     if (!a) return false;
-    bool& physical = (key == a->posKey) ? a->posPhysical : a->negPhysical;
-    if (isKeyDown && !physical) { physical = true; a->lastPressed = key; UpdateAxis(*a); }
-    else if (isKeyUp) { physical = false; UpdateAxis(*a); }
+    bool isHorizontal = (a == &horizontal);
+    bool& physical = (key == a->pos.key) ? a->posPhysical : a->negPhysical;
+    if (isKeyDown && !physical) {
+        physical = true;
+        a->lastPressed = key;
+        if (isHorizontal) a->woolKey = 0;
+        UpdateAxis(*a);
+    } else if (isKeyUp) {
+        physical = false;
+        if (isHorizontal && woolEnabled && spaceHeld && !a->posPhysical && !a->negPhysical)
+            a->woolKey = (key == a->pos.key) ? a->neg.key : a->pos.key;
+        UpdateAxis(*a);
+    }
     return true;
 }
 
 void ReleaseAllActive() {
-    SetKeyState(vertical.posActive, false, vertical.posKey);
-    SetKeyState(vertical.negActive, false, vertical.negKey);
-    SetKeyState(horizontal.posActive, false, horizontal.posKey);
-    SetKeyState(horizontal.negActive, false, horizontal.negKey);
+    VirtualKey* keys[] = {&vertical.pos, &vertical.neg, &horizontal.pos, &horizontal.neg};
+    for (VirtualKey* vk : keys) {
+        if (vk->active) { SendKey(vk->key, false); vk->active = false; }
+        vk->hasPending = false;
+    }
 }
 
 #ifdef _WIN32
@@ -124,8 +204,23 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 int RunWindows() {
     keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
     if (!keyboardHook) { std::cerr << "hook failed: " << GetLastError() << std::endl; return 1; }
-    MSG message;
-    while (running && GetMessage(&message, NULL, 0, 0)) { TranslateMessage(&message); DispatchMessage(&message); }
+    while (running) {
+        long long next = NextPendingTime();
+        DWORD timeoutMs = 100;
+        if (next >= 0) {
+            long long diff = next - NowMs();
+            if (diff <= 0) timeoutMs = 0;
+            else if (diff < 100) timeoutMs = (DWORD)diff;
+        }
+        MsgWaitForMultipleObjects(0, NULL, FALSE, timeoutMs, QS_ALLINPUT);
+        MSG msg;
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        ProcessAllPending();
+    }
     UnhookWindowsHookEx(keyboardHook);
     return 0;
 }
@@ -194,17 +289,28 @@ int RunLinux() {
     std::vector<pollfd> pollfds;
     for (int fd : inputFds) pollfds.push_back({fd, POLLIN, 0});
     while (running) {
-        if (poll(pollfds.data(), pollfds.size(), 100) <= 0) continue;
-        for (auto& p : pollfds) {
-            if (!(p.revents & POLLIN)) continue;
-            struct input_event ev;
-            if (read(p.fd, &ev, sizeof(ev)) != sizeof(ev)) continue;
-            if (ev.type != EV_KEY) { write(uinputFd, &ev, sizeof(ev)); continue; }
-            bool isMovement = AxisForKey(ev.code) != nullptr;
-            if (ev.value == 2) { if (!isMovement) SendKeyValue(ev.code, 2); continue; }
-            HandleKey(ev.code, ev.value == 1, ev.value == 0);
-            if (!HandleMovement(ev.code, ev.value == 1, ev.value == 0)) SendKeyValue(ev.code, ev.value);
+        long long next = NextPendingTime();
+        int timeoutMs = 100;
+        if (next >= 0) {
+            long long diff = next - NowMs();
+            if (diff <= 0) timeoutMs = 0;
+            else if (diff < 100) timeoutMs = (int)diff;
         }
+        int pr = poll(pollfds.data(), pollfds.size(), timeoutMs);
+        if (pr < 0) { ProcessAllPending(); continue; }
+        if (pr > 0) {
+            for (auto& p : pollfds) {
+                if (!(p.revents & POLLIN)) continue;
+                struct input_event ev;
+                if (read(p.fd, &ev, sizeof(ev)) != sizeof(ev)) continue;
+                if (ev.type != EV_KEY) { write(uinputFd, &ev, sizeof(ev)); continue; }
+                bool isMovement = AxisForKey(ev.code) != nullptr;
+                if (ev.value == 2) { if (!isMovement) SendKeyValue(ev.code, 2); continue; }
+                HandleKey(ev.code, ev.value == 1, ev.value == 0);
+                if (!HandleMovement(ev.code, ev.value == 1, ev.value == 0)) SendKeyValue(ev.code, ev.value);
+            }
+        }
+        ProcessAllPending();
     }
     for (int fd : inputFds) { ioctl(fd, EVIOCGRAB, 0); close(fd); }
     ioctl(uinputFd, UI_DEV_DESTROY);
@@ -213,8 +319,37 @@ int RunLinux() {
 }
 #endif
 
-int main() {
-    std::cout << "insert: toggle w release (on by default)\nf7: exit" << std::endl;
+bool MatchPrefix(const std::string& a, const char* p, int& outVal) {
+    size_t n = strlen(p);
+    if (a.size() <= n || a.compare(0, n, p) != 0) return false;
+    outVal = std::atoi(a.c_str() + n);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    vertical.pos.key = KEY_W;
+    vertical.neg.key = KEY_S;
+    horizontal.pos.key = KEY_D;
+    horizontal.neg.key = KEY_A;
+
+    int v;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--wool") woolEnabled = true;
+        else if (MatchPrefix(arg, "--delay-w=", v)) vertical.pos.delayMs = v;
+        else if (MatchPrefix(arg, "--delay-s=", v)) vertical.neg.delayMs = v;
+        else if (MatchPrefix(arg, "--delay-d=", v)) horizontal.pos.delayMs = v;
+        else if (MatchPrefix(arg, "--delay-a=", v)) horizontal.neg.delayMs = v;
+    }
+
+    std::cout << "insert: toggle w release (on by default)\n"
+              << "home: toggle wool (currently " << (woolEnabled ? "on" : "off") << ")\n"
+              << "f7: exit\n"
+              << "delays (ms): w=" << vertical.pos.delayMs
+              << " a=" << horizontal.neg.delayMs
+              << " s=" << vertical.neg.delayMs
+              << " d=" << horizontal.pos.delayMs << std::endl;
+
 #ifdef _WIN32
     int rc = RunWindows();
 #else
